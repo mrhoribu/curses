@@ -9,8 +9,15 @@ permissions:
   contents: read
 
 jobs:
+  # Builds the source gem and the precompiled native gems for this tag and
+  # tests each native gem; see precompiled.yml.
+  native-gems:
+    if: github.repository == 'ruby/curses'
+    uses: ./.github/workflows/precompiled.yml
+
   push:
     if: github.repository == 'ruby/curses'
+    needs: native-gems
     runs-on: ubuntu-latest
 
     environment:
@@ -44,6 +51,39 @@ jobs:
         run: git config fetch.recurseSubmodules false
 
       # Release
+      # The native gems are pushed before the source gem so that, once the
+      # release is visible, the platforms that have one do not fall back to
+      # compiling the source gem. The source gem built by precompiled.yml is
+      # left out: release-gem builds and pushes it.
+      - name: Download native gems
+        uses: actions/download-artifact@v8
+        with:
+          pattern: gem-*-*
+          path: ${{ runner.temp }}/native-gems
+          merge-multiple: true
+
+      - name: Configure trusted publishing credentials
+        uses: rubygems/configure-rubygems-credentials@dc5a8d8553e6ee01fc26761a49e99e733d17954a # v2.1.0
+
+      - name: Publish native gems to RubyGems
+        run: |
+          version="$(ruby -e 'print Gem::Specification.load("curses.gemspec").version')"
+          if [ "${GITHUB_REF_NAME}" != "v${version}" ]; then
+            echo "tag ${GITHUB_REF_NAME} does not match curses.gemspec version ${version}" >&2
+            exit 1
+          fi
+          for gem in "${RUNNER_TEMP}"/native-gems/curses-"${version}"-*.gem; do
+            # A re-run skips the gems an earlier run already pushed.
+            if output="$(gem push "${gem}" 2>&1)"; then
+              echo "${output}"
+            elif echo "${output}" | grep -q "Repushing of gem versions is not allowed"; then
+              echo "${gem##*/} is already published"
+            else
+              echo "${output}" >&2
+              exit 1
+            fi
+          done
+
       - name: Publish to RubyGems
         uses: rubygems/release-gem@v1
 
