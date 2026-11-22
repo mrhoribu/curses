@@ -67,8 +67,26 @@ if $use_bundled_pdcurses
       FileUtils.cp("pdcurses.lib", pdcurses_dir)
       $pdcurses_dll_default = true
     else
-      w64 = $x64 ? "_w64=1" : ""
-      exec_command "make -f Makefile clean libs #{w64} WIDE=Y DLL=N CC=\"gcc -std=gnu17\""
+      arch = if $x64
+               "_w64=1"
+             elsif /aarch64/ =~ RUBY_PLATFORM
+               "_a64=1"
+             else
+               ""
+             end
+      # When cross-compiling (as rake-compiler does for the precompiled
+      # gems), build PDCursesMod with the target's compiler and archiver
+      # rather than the host's gcc. rake-compiler doesn't set
+      # CROSS_COMPILING, but its target's RbConfig has a different build
+      # and host.
+      if RbConfig::CONFIG["build"] != RbConfig::CONFIG["host"]
+        cc = "#{RbConfig::CONFIG['CC']} -std=gnu17"
+        tools = "AR=#{RbConfig::CONFIG['AR']}"
+      else
+        cc = "gcc -std=gnu17"
+        tools = ""
+      end
+      exec_command "make -f Makefile clean libs #{arch} WIDE=Y DLL=N CC=\"#{cc}\" #{tools}"
       FileUtils.cp("pdcurses.a", File.expand_path("libpdcurses.a", pdcurses_dir))
     end
   ensure
