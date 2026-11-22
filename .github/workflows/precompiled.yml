@@ -182,14 +182,19 @@ jobs:
   # Rubies the native gems were not built for must still install curses, by
   # compiling the source gem, rather than fail to resolve.
   test-source-fallback:
-    name: Fall back to the source gem (Ruby ${{ matrix.ruby }})
+    name: Fall back to the source gem (Ruby ${{ matrix.ruby }}, Bundler ${{ matrix.bundler }})
     needs: [source-gem, native-gem]
     runs-on: ubuntu-latest
     timeout-minutes: 20
     strategy:
       fail-fast: false
       matrix:
-        ruby: ['3.0', head]
+        include:
+        - { ruby: '3.0', bundler: default }
+        - { ruby: '3.0', bundler: '2.3.27' }
+        - { ruby: '3.0', bundler: '2.4.22' }
+        - { ruby: '3.0', bundler: '2.5.23' }
+        - { ruby: head, bundler: default }
     steps:
     - uses: actions/checkout@v7
       with:
@@ -197,6 +202,7 @@ jobs:
     - uses: ruby/setup-ruby@v1
       with:
         ruby-version: ${{ matrix.ruby }}
+        bundler: ${{ matrix.bundler }}
     - uses: actions/download-artifact@v8
       with:
         pattern: gem-{ruby,x86_64-linux-gnu}
