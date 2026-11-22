@@ -9,7 +9,18 @@ if File.exist?(pdcurses_dll)
   end
 end
 
-require "curses.so"
+# A precompiled native gem ships one binary per Ruby minor version, in
+# lib/<major.minor>/curses.so; the source gem compiles a single curses.so.
+begin
+  require "#{RUBY_VERSION[/\A\d+\.\d+/]}/curses.so"
+rescue LoadError => e
+  # Fall back only when there is no binary for this Ruby. If there is one but
+  # it fails to load, raise that error rather than a misleading
+  # "cannot load such file -- curses.so".
+  raise unless e.message.start_with?("cannot load such file")
+
+  require "curses.so"
+end
 
 if /mingw|mswin/ =~ RUBY_PLATFORM
   Curses.keyboard_encoding = Encoding::UTF_8

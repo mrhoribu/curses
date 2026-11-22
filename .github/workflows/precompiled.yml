@@ -1,0 +1,206 @@
+name: precompiled
+
+# Builds the source gem plus one precompiled native gem per platform (see
+# NATIVE_PLATFORMS in the Rakefile), then installs each native gem on a
+# matching OS and architecture and checks that it works. push_gem.yml calls
+# this workflow on a release tag and publishes the gems it built.
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+  workflow_dispatch:
+  workflow_call:
+
+permissions:
+  contents: read
+
+jobs:
+  source-gem:
+    name: Build source gem
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+    - uses: actions/checkout@v7
+      with:
+        submodules: true
+        persist-credentials: false
+    - uses: ruby/setup-ruby@v1
+      with:
+        ruby-version: '4.0'
+        bundler-cache: true
+    - run: bundle exec rake build
+    - name: Install the source gem (compiles the extension) and load it
+      run: |
+        sudo apt-get install -y libncursesw5-dev
+        gem install --local --no-document pkg/curses-*.gem
+        cd "$RUNNER_TEMP"
+        # shellcheck disable=SC2016 # Ruby code, not shell expansions
+        ruby -e 'require "curses"; abort "wrong binary" if $LOADED_FEATURES.grep(%r{/\d+\.\d+/curses\.so\z}).any?; puts Curses::VERSION'
+    - uses: actions/upload-artifact@v7
+      with:
+        name: gem-ruby
+        path: pkg/*.gem
+        if-no-files-found: error
+
+  native-gem:
+    name: Build ${{ matrix.platform }} gem
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        platform:
+        - aarch64-linux-gnu
+        - aarch64-linux-musl
+        - aarch64-mingw-ucrt
+        - arm-linux-gnu
+        - arm-linux-musl
+        - arm64-darwin
+        - x64-mingw-ucrt
+        - x86-linux-gnu
+        - x86-linux-musl
+        - x86_64-darwin
+        - x86_64-linux-gnu
+        - x86_64-linux-musl
+    steps:
+    - uses: actions/checkout@v7
+      with:
+        submodules: true
+        persist-credentials: false
+    - uses: ruby/setup-ruby@v1
+      with:
+        ruby-version: '4.0'
+        bundler-cache: true
+    - run: bundle exec rake gem:native:${{ matrix.platform }}
+    - name: Check the gem carries only what a native gem needs
+      run: |
+        # shellcheck disable=SC2016 # Ruby code, not shell expansions
+        ruby -rrubygems/package -e '
+          gem = Dir["pkg/*-#{ARGV[0]}.gem"].first or abort "no #{ARGV[0]} gem built"
+          spec = Gem::Package.new(gem).spec
+          sources = spec.files.grep(%r{\A(ext|vendor/PDCursesMod)/})
+          abort "ships sources: #{sources}" unless sources.empty?
+          abort "require_paths is #{spec.require_paths}" unless spec.require_paths == ["lib"]
+          abort "declares extensions: #{spec.extensions}" unless spec.extensions.empty?
+          puts spec.files
+        ' ${{ matrix.platform }}
+    - uses: actions/upload-artifact@v7
+      with:
+        name: gem-${{ matrix.platform }}
+        path: pkg/*-${{ matrix.platform }}.gem
+        if-no-files-found: error
+
+  # macOS and Windows: install on the runner's own Ruby, on matching hardware.
+  test-native-gem:
+    name: Test ${{ matrix.platform }} gem (Ruby ${{ matrix.ruby }})
+    needs: [source-gem, native-gem]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        platform: [arm64-darwin, x86_64-darwin, x64-mingw-ucrt, aarch64-mingw-ucrt]
+        ruby: ['3.1', '3.2', '3.3', '3.4', '4.0']
+        include:
+        - { platform: arm64-darwin, os: macos-latest }
+        - { platform: x86_64-darwin, os: macos-26-intel }
+        - { platform: x64-mingw-ucrt, os: windows-latest }
+        - { platform: aarch64-mingw-ucrt, os: windows-11-arm }
+        exclude:
+        # RubyInstaller for Windows on ARM64 starts at Ruby 3.4.
+        - { platform: aarch64-mingw-ucrt, ruby: '3.1' }
+        - { platform: aarch64-mingw-ucrt, ruby: '3.2' }
+        - { platform: aarch64-mingw-ucrt, ruby: '3.3' }
+    steps:
+    - uses: actions/checkout@v7
+      with:
+        persist-credentials: false
+    - uses: ruby/setup-ruby@v1
+      with:
+        ruby-version: ${{ matrix.ruby }}
+    - uses: actions/download-artifact@v8
+      with:
+        pattern: gem-{ruby,${{ matrix.platform }}}
+        path: gems
+        merge-multiple: true
+    - run: sh .github/scripts/test-installed-gem.sh ${{ matrix.platform }} gems
+      shell: bash
+
+  # Linux: install inside the official Ruby images, which have no ncurses
+  # development files, and the Alpine ones no C compiler either, so a gem that
+  # tried to build its extension there would fail. linux/386 runs natively on
+  # the x64 runner and linux/arm/v7 under QEMU on the arm64 one.
+  test-native-gem-linux:
+    name: Test ${{ matrix.platform }} gem (Ruby ${{ matrix.ruby }})
+    needs: [source-gem, native-gem]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        platform:
+        - x86_64-linux-gnu
+        - x86_64-linux-musl
+        - x86-linux-gnu
+        - x86-linux-musl
+        - aarch64-linux-gnu
+        - aarch64-linux-musl
+        - arm-linux-gnu
+        - arm-linux-musl
+        ruby: ['3.1', '3.2', '3.3', '3.4', '4.0']
+        include:
+        - { platform: x86_64-linux-gnu, os: ubuntu-latest, image: '', docker-platform: linux/amd64 }
+        - { platform: x86_64-linux-musl, os: ubuntu-latest, image: '-alpine', docker-platform: linux/amd64 }
+        - { platform: x86-linux-gnu, os: ubuntu-latest, image: '', docker-platform: linux/386 }
+        - { platform: x86-linux-musl, os: ubuntu-latest, image: '-alpine', docker-platform: linux/386 }
+        - { platform: aarch64-linux-gnu, os: ubuntu-26.04-arm, image: '', docker-platform: linux/arm64 }
+        - { platform: aarch64-linux-musl, os: ubuntu-26.04-arm, image: '-alpine', docker-platform: linux/arm64 }
+        - { platform: arm-linux-gnu, os: ubuntu-26.04-arm, image: '', docker-platform: linux/arm/v7 }
+        - { platform: arm-linux-musl, os: ubuntu-26.04-arm, image: '-alpine', docker-platform: linux/arm/v7 }
+    steps:
+    - uses: actions/checkout@v7
+      with:
+        persist-credentials: false
+    - uses: actions/download-artifact@v8
+      with:
+        pattern: gem-{ruby,${{ matrix.platform }}}
+        path: gems
+        merge-multiple: true
+    - name: Set up QEMU
+      if: matrix.docker-platform == 'linux/arm/v7'
+      uses: docker/setup-qemu-action@v4
+      with:
+        platforms: arm
+    - name: Install and test in ruby:${{ matrix.ruby }}${{ matrix.image }} (${{ matrix.docker-platform }})
+      run: >-
+        docker run --rm --platform ${{ matrix.docker-platform }}
+        -v "$PWD:/curses" -w /curses
+        ruby:${{ matrix.ruby }}${{ matrix.image }}
+        sh .github/scripts/test-installed-gem.sh ${{ matrix.platform }} gems
+
+  # Rubies the native gems were not built for must still install curses, by
+  # compiling the source gem, rather than fail to resolve.
+  test-source-fallback:
+    name: Fall back to the source gem (Ruby ${{ matrix.ruby }})
+    needs: [source-gem, native-gem]
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        ruby: ['3.0', head]
+    steps:
+    - uses: actions/checkout@v7
+      with:
+        persist-credentials: false
+    - uses: ruby/setup-ruby@v1
+      with:
+        ruby-version: ${{ matrix.ruby }}
+    - uses: actions/download-artifact@v8
+      with:
+        pattern: gem-{ruby,x86_64-linux-gnu}
+        path: gems
+        merge-multiple: true
+    - run: sudo apt-get install -y libncursesw5-dev
+    - run: sh .github/scripts/test-source-fallback.sh x86_64-linux-gnu gems
