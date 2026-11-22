@@ -102,14 +102,130 @@ if $use_bundled_pdcurses
   ]
 end
 
+# --enable-vendored-ncurses downloads ncurses, builds it as a static library
+# and links it into the extension, so that the extension doesn't depend on
+# the ncurses shared libraries installed on the system. The precompiled
+# Linux and macOS gems are built this way; see NATIVE_PLATFORMS in the
+# Rakefile. ncurses still reads the system's terminfo database at run time.
+$use_vendored_ncurses = !$use_bundled_pdcurses &&
+                        enable_config("vendored-ncurses", false)
+if $use_vendored_ncurses
+  require 'digest'
+  require 'etc'
+  require 'open-uri'
+  require 'rbconfig'
+
+  NCURSES_VERSION = "6.6"
+  NCURSES_SHA256 = "355b4cbbed880b0381a04c46617b7656e362585d52e9cf84a67e2009b749ff11"
+  NCURSES_URLS = [
+    "https://invisible-island.net/archives/ncurses/ncurses-#{NCURSES_VERSION}.tar.gz",
+    "https://ftp.gnu.org/gnu/ncurses/ncurses-#{NCURSES_VERSION}.tar.gz",
+  ]
+  # Where the ncurses terminfo database is installed on common systems:
+  # Debian and Ubuntu (/lib, /usr/share), Alpine (/etc, /usr/share),
+  # Fedora, Arch and macOS (/usr/share), and some BSDs (/usr/lib).
+  NCURSES_TERMINFO_DIRS = %w[
+    /etc/terminfo /lib/terminfo /usr/share/terminfo /usr/lib/terminfo
+  ]
+
+  host = RbConfig::CONFIG["host"]
+  ports_dir = File.expand_path("../../ports", __dir__)
+  archive = File.join(ports_dir, "archives", "ncurses-#{NCURSES_VERSION}.tar.gz")
+  prefix = File.join(ports_dir, host, "ncurses", NCURSES_VERSION)
+
+  # Built once per target and shared by every Ruby version built for it.
+  unless File.exist?(File.join(prefix, "lib", "libncursesw.a"))
+    unless File.exist?(archive) &&
+           Digest::SHA256.file(archive).hexdigest == NCURSES_SHA256
+      FileUtils.mkdir_p(File.dirname(archive))
+      data = NCURSES_URLS.lazy.filter_map {|url|
+        puts "> download #{url}"
+        begin
+          URI.open(url, "rb", &:read)
+        rescue => e
+          STDERR.puts("#{url}: #{e.message}")
+          nil
+        end
+      }.first or abort "could not download ncurses #{NCURSES_VERSION}"
+      digest = Digest::SHA256.hexdigest(data)
+      if digest != NCURSES_SHA256
+        abort "ncurses-#{NCURSES_VERSION}.tar.gz has SHA256 #{digest}, " \
+              "expected #{NCURSES_SHA256}"
+      end
+      File.binwrite(archive, data)
+    end
+
+    build_dir = File.join(ports_dir, host, "ncurses", "build")
+    FileUtils.rm_rf(build_dir)
+    FileUtils.mkdir_p(build_dir)
+    exec_command "tar -xzf #{archive.shellescape} -C #{build_dir.shellescape}"
+    configure = [
+      "./configure",
+      "--host=#{host}",
+      "--prefix=#{prefix}",
+      "--enable-widec",
+      "--without-shared",
+      "--with-normal",
+      "--without-debug",
+      "--without-profile",
+      "--without-cxx",
+      "--without-cxx-binding",
+      "--without-ada",
+      "--without-progs",
+      "--without-tests",
+      "--without-manpages",
+      "--without-gpm",
+      "--disable-db-install",
+      "--disable-pc-files",
+      "--with-default-terminfo-dir=/usr/share/terminfo",
+      "--with-terminfo-dirs=#{NCURSES_TERMINFO_DIRS.join(':')}",
+      "CC=#{RbConfig::CONFIG['CC']}",
+      "AR=#{RbConfig::CONFIG['AR']}",
+      "RANLIB=#{RbConfig::CONFIG['RANLIB']}",
+      # The static libraries are linked into a shared object.
+      "CFLAGS=-O2 -fPIC",
+    ]
+    # macOS's terminfo database is laid out for a case-insensitive file
+    # system (/usr/share/terminfo/78/xterm, not x/xterm). configure only
+    # detects that when building on macOS, not when cross-compiling for it.
+    configure << "--disable-mixed-case" if /darwin/ =~ host
+    Dir.chdir(File.join(build_dir, "ncurses-#{NCURSES_VERSION}")) do
+      exec_command Shellwords.join(configure)
+      exec_command "make -j#{Etc.nprocessors}"
+      exec_command "make install"
+    end
+    FileUtils.rm_rf(build_dir)
+  end
+
+  # Not dir_config, which would also add the build directory to the
+  # extension's run-time library search path.
+  $INCFLAGS = "-I#{File.join(prefix, 'include')} #{$INCFLAGS}"
+  $LDFLAGS = "-L#{File.join(prefix, 'lib')} #{$LDFLAGS}"
+  # Keep the vendored ncurses symbols out of the extension's dynamic symbol
+  # table, so that they can't clash with a system ncurses loaded into the
+  # same process by another extension.
+  if /linux/ =~ RUBY_PLATFORM
+    $DLDFLAGS << " -Wl,--exclude-libs,ALL"
+  end
+  $library_candidates = [
+    ["ncursesw/curses.h", ["ncursesw"]]
+  ]
+  # Known, so that it needn't be detected by running a test program, which
+  # fails when cross-compiling.
+  $curses_version_default = "function"
+end
+
 dir_config('curses', $idefault, $ldefault)
 dir_config('ncurses')
 dir_config('termcap')
 
-have_library("mytinfo", "tgetent") if /bow/ =~ RUBY_PLATFORM
-have_library("tinfow", "tgetent") ||
-  have_library("tinfo", "tgetent") ||
-  have_library("termcap", "tgetent")
+# The vendored ncurses has its terminfo functions built in.
+unless $use_vendored_ncurses
+  have_library("mytinfo", "tgetent") if /bow/ =~ RUBY_PLATFORM
+  have_library("tinfow", "tgetent") ||
+    have_library("tinfo", "tgetent") ||
+    have_library("termcap", "tgetent")
+end
 
 header_library = nil
 $library_candidates.each {|hdr, libs|
